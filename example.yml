@@ -1,0 +1,173 @@
+name: Docker
+
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+
+on:
+  push:
+    branches: [ "main" ]
+    # Publish semver tags as releases.
+    tags: [ 'v*.*.*' ]
+
+env:
+  # Use docker.io for Docker Hub if empty
+  REGISTRY: ghcr.io
+  # github.repository as <account>/<repo>
+  IMAGE_NAME: ${{ github.repository }}
+
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # This is used to complete the identity challenge
+      # with sigstore/fulcio when running outside of PRs.
+      id-token: write
+
+    steps:
+      - name: cleanup space on github vm
+        run: |
+          rm -rf /usr/share/dotnet
+          rm -rf "$AGENT_TOOLSDIRECTORY"
+          df -h
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Configure Docker to use split storage across / and /mnt
+      - name: Configure split Docker storage
+        run: |
+          echo "Available space before Docker configuration:"
+          df -h
+          
+          # Stop Docker first to avoid conflicts
+          sudo systemctl stop docker || true
+          
+          # Create storage directories on both filesystems
+          sudo mkdir -p /var/lib/docker
+          sudo mkdir -p /mnt/docker-storage
+          sudo mkdir -p /var/lib/buildkit
+          sudo mkdir -p /mnt/buildkit-storage
+          
+          # Create subdirectories for Docker storage
+          sudo mkdir -p /mnt/docker-storage/overlay2
+          sudo mkdir -p /mnt/docker-storage/containers
+          sudo mkdir -p /mnt/docker-storage/volumes
+          sudo mkdir -p /mnt/docker-storage/image
+          
+          # Use bind mounts instead of symbolic links for better compatibility
+          sudo mount --bind /mnt/docker-storage/overlay2 /var/lib/docker/overlay2 2>/dev/null || true
+          sudo mount --bind /mnt/docker-storage/containers /var/lib/docker/containers 2>/dev/null || true
+          sudo mount --bind /mnt/docker-storage/volumes /var/lib/docker/volumes 2>/dev/null || true
+          sudo mount --bind /mnt/docker-storage/image /var/lib/docker/image 2>/dev/null || true
+          
+          # Create BuildKit storage on /mnt
+          sudo mount --bind /mnt/buildkit-storage /var/lib/buildkit 2>/dev/null || true
+          
+          # Configure Docker with optimized storage settings
+          sudo mkdir -p /etc/docker
+          cat << EOF | sudo tee /etc/docker/daemon.json
+          {
+            "data-root": "/var/lib/docker",
+            "storage-driver": "overlay2",
+            "storage-opts": [
+              "overlay2.override_kernel_check=true"
+            ],
+            "max-concurrent-downloads": 10,
+            "max-concurrent-uploads": 5,
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "100m",
+              "max-file": "3"
+            }
+          }
+          EOF
+          
+          # Start Docker with error handling
+          echo "Starting Docker service..."
+          if sudo systemctl start docker; then
+            echo "Docker started successfully"
+            sudo systemctl status docker --no-pager
+          else
+            echo "Docker failed to start. Checking logs..."
+            sudo journalctl -xeu docker.service --no-pager | tail -50
+            echo "Attempting to start with default configuration..."
+            sudo rm -f /etc/docker/daemon.json
+            sudo systemctl start docker
+          fi
+          
+          echo "Split storage configured:"
+          echo "Docker root: $(docker info | grep 'Docker Root Dir' || echo 'Docker not responding')"
+          echo "BuildKit root: /var/lib/buildkit"
+          echo "Storage distribution:"
+          echo "  Root (/): Image metadata, logs, configs"
+          echo "  /mnt: Large files (layers, containers, volumes)"
+          echo "Available space after configuration:"
+          df -h
+          echo "Mount points:"
+          mount | grep -E "(docker|buildkit)" || echo "No Docker mounts found"
+
+      # Install the cosign tool except on PR
+      # https://github.com/sigstore/cosign-installer
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 #v3.5.0
+        with:
+          cosign-release: 'v2.2.4'
+      # Set up BuildKit Docker container builder to be able to build
+      # multi-platform images and export cache
+      # https://github.com/docker/setup-buildx-action
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
+        with:
+          driver-opts: |
+            image=moby/buildkit:v0.12.4
+          buildkitd-flags: --root /var/lib/buildkit
+
+      # Login against a Docker registry except on PR
+      # https://github.com/docker/login-action
+      - name: Log into registry ${{ env.REGISTRY }}
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Extract metadata (tags, labels) for Docker
+      # https://github.com/docker/metadata-action
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+      # Build and push Docker image with Buildx (don't push on PR)
+      # https://github.com/docker/build-push-action
+      - name: Build and push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09 # v5.0.0
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      # Sign the resulting Docker image digest except on PRs.
+      # This will only write to the public Rekor transparency log when the Docker
+      # repository is public to avoid leaking data.  If you would like to publish
+      # transparency data even for private images, pass --force to cosign below.
+      # https://github.com/sigstore/cosign
+      - name: Sign the published Docker image
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          # https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+        # This step uses the identity token to provision an ephemeral certificate
+        # against the sigstore community Fulcio instance.
+        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
